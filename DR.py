@@ -1,139 +1,283 @@
-# ===================== AE自编码器 =====================
-class AE(nn.Module):
-    def __init__(self, input_dim, latent_dim=8):
+
+
+class CrossModalAttention(nn.Module):
+    def __init__(self, dim, num_modals=3):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, latent_dim)
+        self.query_proj = nn.Linear(dim, dim)
+        self.key_proj = nn.Linear(dim, dim)
+        self.value_proj = nn.Linear(dim, dim)
+        self.scale = dim ** 0.5
+        self.num_modals = num_modals
+
+    def forward(self, modal_features):
+        batch_size = modal_features[0].shape[0]
+        query = self.query_proj(modal_features[0]).unsqueeze(1)
+        keys = []
+        values = []
+        for feat in modal_features:
+            keys.append(self.key_proj(feat).unsqueeze(1))
+            values.append(self.value_proj(feat).unsqueeze(1))
+        keys = torch.cat(keys, dim=1)
+        values = torch.cat(values, dim=1)
+        attn_weights = torch.matmul(query, keys.transpose(-2, -1)) / self.scale
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        fused_features = torch.matmul(attn_weights, values).squeeze(1)
+        return fused_features, attn_weights
+
+class BandAttention(nn.Module):
+    def __init__(self, in_dim, num_bands=NUM_BANDS):
+        super().__init__()
+        self.num_bands = num_bands
+        self.attention = nn.Sequential(
+            nn.Linear(in_dim, in_dim // 2),
+            nn.Tanh(),
+            nn.Linear(in_dim // 2, 1)
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 32),
+
+    def forward(self, band_features):
+        attn_weights = []
+        for band_feat in band_features:
+            weight = self.attention(band_feat)
+            attn_weights.append(weight)
+        attn_weights = torch.cat(attn_weights, dim=1)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        band_features = torch.stack(band_features, dim=1)
+        attn_weights = attn_weights.unsqueeze(-1)
+        fused_band_feat = torch.sum(band_features * attn_weights, dim=1)
+        return fused_band_feat, attn_weights
+
+class lg_gnn(nn.Module):
+    def __init__(self, dl, mmse_tensor=None, entropy_tensor=None, device='cuda',
+                 ablation_mode=None):
+        super(lg_gnn, self).__init__()
+        self.dl = dl
+        self.device = device
+        self.node_ftr_dim = dl.node_ftr_dim
+        self.num_bands = NUM_BANDS
+        self.ablation_mode = ablation_mode
+
+        self.node_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.node_ftr_dim, NODE_HIDDEN_DIM * 2),
+                nn.ReLU(),
+                nn.LayerNorm(NODE_HIDDEN_DIM * 2),
+                nn.Dropout(DROPOUT_RATE),
+                nn.Linear(NODE_HIDDEN_DIM * 2, NODE_HIDDEN_DIM)
+            ) for _ in range(self.num_bands)
+        ])
+        for encoder in self.node_encoders:
+            self._init_linear_layers(encoder)
+
+        self.use_gat = ablation_mode != "no_gat"
+        if self.use_gat:
+            self.gnns = nn.ModuleList([
+                GATConv(NODE_HIDDEN_DIM, FUSION_DIM, heads=1, concat=False)
+                for _ in range(self.num_bands)
+            ])
+        else:
+            self.gnns = nn.ModuleList([
+                GCNConv(NODE_HIDDEN_DIM, FUSION_DIM)
+                for _ in range(self.num_bands)
+            ])
+
+        self.gnn_norms = nn.ModuleList([
+            nn.LayerNorm(FUSION_DIM) for _ in range(self.num_bands)
+        ])
+        self._init_gnn_layers()
+
+        self.band_attention = BandAttention(FUSION_DIM, self.num_bands) if ablation_mode != "no_band_attn" else None
+        self.band_embeddings = nn.Embedding(self.num_bands, NODE_HIDDEN_DIM) if ablation_mode != "no_band_emb" else None
+        if self.band_embeddings is not None:
+            nn.init.xavier_normal_(self.band_embeddings.weight)
+
+        self.use_mmse = mmse_tensor is not None and ablation_mode != "no_mmse"
+        self.mmse_encoder = None
+        self.mmse_tensor = None
+        if self.use_mmse:
+            self.mmse_dim = mmse_tensor.shape[1]
+            self.mmse_encoder = nn.Sequential(
+                nn.Linear(self.mmse_dim, MMSE_HIDDEN_DIM),
+                nn.ReLU(),
+                nn.LayerNorm(MMSE_HIDDEN_DIM),
+                nn.Dropout(DROPOUT_RATE),
+                nn.Linear(MMSE_HIDDEN_DIM, FUSION_DIM)
+            )
+            self._init_linear_layers(self.mmse_encoder)
+            self.mmse_tensor = mmse_tensor.to(device)
+
+        self.use_entropy = entropy_tensor is not None and ablation_mode != "no_entropy"
+        self.entropy_encoder = None
+        self.entropy_tensor = None
+        if self.use_entropy:
+            self.entropy_dim = entropy_tensor.shape[1]
+            self.entropy_encoder = nn.Sequential(
+                nn.Linear(self.entropy_dim, ENTROPY_HIDDEN_DIM),
+                nn.ReLU(),
+                nn.LayerNorm(ENTROPY_HIDDEN_DIM),
+                nn.Dropout(DROPOUT_RATE),
+                nn.Linear(ENTROPY_HIDDEN_DIM, FUSION_DIM)
+            )
+            self._init_linear_layers(self.entropy_encoder)
+            self.entropy_tensor = entropy_tensor.to(device)
+
+        self.use_cross_modal = ablation_mode != "no_cross_modal"
+        self.num_modals = 1
+        if self.use_mmse: self.num_modals += 1
+        if self.use_entropy: self.num_modals += 1
+        self.cross_modal_attn = CrossModalAttention(FUSION_DIM, self.num_modals) if self.use_cross_modal else None
+
+        self.classifier = nn.Sequential(
+            nn.Linear(FUSION_DIM, FUSION_DIM),
             nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Linear(64, input_dim)
+            nn.LayerNorm(FUSION_DIM),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(FUSION_DIM, 2)
         )
+        self._init_linear_layers(self.classifier)
 
-    def forward(self, x):
-        z = self.encoder(x)
-        recon = self.decoder(z)
-        return recon, z
+        self.use_mi_loss = ablation_mode != "no_mi_loss"
+        if self.use_mi_loss:
+            self.mi_projector = nn.Sequential(
+                nn.Linear(FUSION_DIM, 8),
+                nn.ReLU(),
+                nn.Dropout(DROPOUT_RATE),
+                nn.Linear(8, 4)
+            )
+            self._init_linear_layers(self.mi_projector)
 
-def cluster_states(Z_train, Z_test, n_clusters, seed):
+        self.gnn_weight = nn.Parameter(torch.ones(1))
+        self.mmse_weight = nn.Parameter(torch.ones(1)) if self.use_mmse else None
+        self.entropy_weight = nn.Parameter(torch.ones(1)) if self.use_entropy else None
 
-    model = KMeans(
-        n_clusters=n_clusters,
-        random_state=seed
-    )
+        self.label_smoothing = 0.0 if ablation_mode == "no_label_smoothing" else LABEL_SMOOTHING
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        self.temp_scale = 1.0 if ablation_mode == "no_temp_scaling" else TEMP_SCALE
 
-    train_label = model.fit_predict(Z_train)
-    test_label = model.predict(Z_test)
+    def _init_linear_layers(self, modules):
+        if isinstance(modules, nn.Sequential):
+            for m in modules:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0.0)
+        elif isinstance(modules, list):
+            for m in modules:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0.0)
+        elif isinstance(modules, nn.Linear):
+            nn.init.xavier_normal_(modules.weight)
+            if modules.bias is not None:
+                nn.init.constant_(modules.bias, 0.0)
 
-    return train_label, test_label
+    def _init_gnn_layers(self):
+        for gnn in self.gnns:
+            gnn_layers = []
+            if hasattr(gnn, 'lin'):
+                gnn_layers.append(gnn.lin)
+            else:
+                if hasattr(gnn, 'lin_src'):
+                    gnn_layers.append(gnn.lin_src)
+                if hasattr(gnn, 'lin_dst'):
+                    gnn_layers.append(gnn.lin_dst)
+            if hasattr(gnn, 'lin'):
+                gnn_layers.append(gnn.lin)
+            self._init_linear_layers(gnn_layers)
 
-# ===================== 行为策略计算 =====================
-def get_behavior_policy_discrete(df, n_actions=6):
-    behavior_policy = {}
-    global_act_prob = df["medication_action"].value_counts(normalize=True).to_dict()
-    for a in range(n_actions):
-        if a not in global_act_prob:
-            global_act_prob[a] = 1e-8
-    for _, row in df.iterrows():
-        s = int(row["state_id_dl"])
-        a = int(row["medication_action"])
-        if s not in behavior_policy:
-            behavior_policy[s] = {act: 1e-8 for act in range(n_actions)}
-        behavior_policy[s][a] += 1
-    for s in behavior_policy:
-        total = sum(behavior_policy[s].values())
-        for a in behavior_policy[s]:
-            behavior_policy[s][a] /= total
-    return behavior_policy, global_act_prob
+    def compute_mi_loss(self, z1, z2):
+        batch_size = z1.shape[0]
+        z1 = F.layer_norm(z1, z1.shape[1:])
+        z2 = F.layer_norm(z2, z2.shape[1:])
+        p1 = self.mi_projector(z1)
+        p2 = self.mi_projector(z2)
+        sim_matrix = torch.mm(p1, p2.t()) / np.sqrt(4)
+        labels = torch.arange(batch_size).to(self.device)
+        loss = F.cross_entropy(sim_matrix, labels) + F.cross_entropy(sim_matrix.t(), labels)
+        return loss / 2.0
 
-# ===================== 构建MDP Transition =====================
-def build_transitions(df):
-    rows = []
-    df = df.sort_values(["PTID", "VISDATE"]).copy()
-    for pid, d in df.groupby("PTID"):
-        d = d.sort_values("VISDATE").reset_index(drop=True)
-        for i in range(len(d)):
-            rows.append({
-                "state": int(d.loc[i, "state_id_dl"]),
-                "action": int(d.loc[i, "medication_action"]),
-                "reward": float(d.loc[i, "reward"]),
-                "next_state": int(d.loc[i, "next_state_id_dl"]),
-                "done": True if i == len(d) - 1 else False
-            })
-    transitions = pd.DataFrame(rows)
-    return transitions.reset_index(drop=True)
-
-# ===================== QLearning MDP模型 =====================
-class QLearningMDP:
-    def __init__(self, n_states, n_actions=6, gamma=0.95, alpha=0.1, epsilon_eval=0.05):
-        self.n_states = n_states
-        self.n_actions = n_actions
-        self.gamma = gamma
-        self.alpha = alpha
-        self.epsilon_eval = epsilon_eval
-        self.Q = np.zeros((n_states, n_actions))
-
-    def train(self, trans_df, n_epochs=200):
-        data = trans_df.values.tolist()
-        for epoch in range(n_epochs):
-            random.shuffle(data)
-            for s, a, r, s_next, done in data:
-                s = int(s)
-                a = int(a)
-                s_next = int(s_next)
-                r = float(r)
-                done = bool(done)
-                if done:
-                    target = r
+    def forward(self, raw_features, labels=None, indices=None):
+        batch_band_features = []
+        for band_idx in range(self.num_bands):
+            band_graphs = [sample_bands[band_idx] for sample_bands in raw_features]
+            band_feats = []
+            for graph in band_graphs:
+                graph = graph.to(self.device)
+                node_ftr = self.node_encoders[band_idx](graph.x)
+                if self.band_embeddings is not None:
+                    band_emb = self.band_embeddings(torch.tensor(band_idx, device=self.device))
+                    node_ftr = node_ftr + band_emb.unsqueeze(0)
+                node_ftr = F.layer_norm(node_ftr, node_ftr.shape[1:])
+                if self.use_gat:
+                    gnn_out = self.gnns[band_idx](node_ftr, graph.edge_index, edge_attr=graph.edge_attr)
                 else:
-                    target = r + self.gamma * np.max(self.Q[s_next])
-                self.Q[s, a] += self.alpha * (target - self.Q[s, a])
+                    gnn_out = self.gnns[band_idx](node_ftr, graph.edge_index)
+                gnn_out = self.gnn_norms[band_idx](gnn_out)
+                gnn_out = F.relu(gnn_out)
+                gnn_out = F.dropout(gnn_out, p=DROPOUT_RATE, training=self.training)
+                batch = torch.zeros(gnn_out.shape[0], dtype=torch.long).to(self.device)
+                graph_feature = global_mean_pool(gnn_out, batch=batch)
+                band_feats.append(graph_feature)
+            band_feats = torch.cat(band_feats, dim=0)
+            batch_band_features.append(band_feats)
 
-    def select_action(self, s):
-        return int(np.argmax(self.Q[int(s)]))
+        if self.band_attention is None:
+            fused_gnn_feat = torch.stack(batch_band_features, dim=1).mean(dim=1)
+        else:
+            fused_gnn_feat, _ = self.band_attention(batch_band_features)
+        fused_gnn_feat = fused_gnn_feat * self.gnn_weight
 
-    def get_action_probs(self, s):
-        p = np.ones(self.n_actions) * (self.epsilon_eval / self.n_actions)
-        best_a = self.select_action(s)
-        p[best_a] += 1.0 - self.epsilon_eval
-        return p
+        mmse_features = None
+        if self.use_mmse:
+            if indices is not None:
+                batch_mmse = self.mmse_tensor[indices]
+            else:
+                batch_mmse = self.mmse_tensor[:len(raw_features)]
+            mmse_tensor_norm = F.layer_norm(batch_mmse, batch_mmse.shape[1:])
+            mmse_features = self.mmse_encoder(mmse_tensor_norm) * self.mmse_weight
 
-    @property
-    def policy(self):
-        return np.argmax(self.Q, axis=1)
+        entropy_features = None
+        if self.use_entropy:
+            if indices is not None:
+                batch_entropy = self.entropy_tensor[indices]
+            else:
+                batch_entropy = self.entropy_tensor[:len(raw_features)]
+            entropy_tensor_norm = F.layer_norm(batch_entropy, batch_entropy.shape[1:])
+            entropy_features = self.entropy_encoder(entropy_tensor_norm) * self.entropy_weight
 
-# ===================== 反事实指标   =====================
-def calculate_counterfactual_metrics(model, test_df, train_trans_df):
-    eval_df = test_df.dropna(subset=["reward"]).copy()
-    reward_table = train_trans_df.groupby(["state", "action"])["reward"].mean().to_dict()
-    global_reward = train_trans_df["reward"].mean()
-    delta_r_list = []
-    success_list = []
-    doctor_cf_rewards = []
-    model_cf_rewards = []
-    for _, row in eval_df.iterrows():
-        s = int(row["state_id_dl"])
-        a_doc = int(row["medication_action"])
-        a_model = int(model.select_action(s))
-        r_doc_real = float(row["reward"])
-        r_doc_cf = reward_table.get((s, a_doc), global_reward)
-        r_model_cf = reward_table.get((s, a_model), global_reward)
-        delta_r = r_model_cf - r_doc_real
-        doctor_cf_rewards.append(r_doc_cf)
-        model_cf_rewards.append(r_model_cf)
-        delta_r_list.append(delta_r)
-        success_list.append(1 if r_model_cf > r_doc_cf else 0)
-    return {
-        "doctor_estimated_delta_mmse": np.mean(doctor_cf_rewards) if doctor_cf_rewards else 0.0,
-        "model_estimated_delta_mmse": np.mean(model_cf_rewards) if model_cf_rewards else 0.0,
-        "counterfactual_delta_mmse": np.mean(delta_r_list) if delta_r_list else 0.0,
-        "success_rate": np.mean(success_list) if success_list else 0.0,
-        "n_cf_eval": len(delta_r_list)
-    }
+        modal_features = [F.layer_norm(fused_gnn_feat, fused_gnn_feat.shape[1:])]
+        if self.use_mmse:
+            modal_features.append(F.layer_norm(mmse_features, mmse_features.shape[1:]))
+        if self.use_entropy:
+            modal_features.append(F.layer_norm(entropy_features, entropy_features.shape[1:]))
+
+        if self.use_cross_modal:
+            fused_features, _ = self.cross_modal_attn(modal_features)
+        else:
+            fused_features = torch.cat(modal_features, dim=1)
+            if fused_features.shape[1] != FUSION_DIM:
+                fused_features = nn.Linear(fused_features.shape[1], FUSION_DIM).to(self.device)(fused_features)
+
+        fused_features = F.relu(fused_features)
+        fused_features = F.layer_norm(fused_features, fused_features.shape[1:])
+        logits = self.classifier(fused_features) / self.temp_scale
+        total_loss = 0.0
+
+        if labels is not None:
+            cls_loss = self.criterion(logits, labels)
+            mi_loss = 0.0
+            if self.use_mi_loss:
+                if self.use_mmse:
+                    mi_loss += self.compute_mi_loss(fused_gnn_feat, mmse_features) * 0.05
+                if self.use_entropy:
+                    mi_loss += self.compute_mi_loss(fused_gnn_feat, entropy_features) * 0.05
+            total_loss = cls_loss + mi_loss
+        else:
+            total_loss = torch.tensor(0.0).to(self.device)
+        return logits, total_loss
+
+    def build_sample_graph(self, embeddings, indices):
+        if indices is None:
+            indices = np.arange(len(embeddings))
+        return np.ones((len(indices), len(indices)))
+
